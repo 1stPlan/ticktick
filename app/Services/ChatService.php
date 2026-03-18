@@ -88,7 +88,7 @@ PROMPT;
     {
         $apiKey = config('services.openai.api_key');
         if (empty($apiKey)) {
-            return '申し訳ございません。OPENAI_API_KEY が設定されていないため、お応えできません。.env ファイルを確認してください。';
+            return '申し訳ございません。AIサービスが設定されていないため、お応えできません。';
         }
 
         $client = OpenAI::client($apiKey, config('services.openai.organization'));

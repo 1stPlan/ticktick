@@ -10,7 +10,6 @@
         "ladumor/laravel-pwa": "^1.0",
         "laravel/framework": "^10.10",
         "laravel/sanctum": "^3.3",
-        "laravel/socialite": "^5.25",
         "laravel/tinker": "^2.8",
         "livewire/livewire": "^4.2",
         "openai-php/client": "^0.10.3",

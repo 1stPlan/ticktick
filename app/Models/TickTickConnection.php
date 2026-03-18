@@ -17,6 +17,7 @@ class TickTickConnection extends Model
         'refresh_token',
         'expires_at',
         'default_project_id',
+        'session_id',
     ];
 
     protected $casts = [

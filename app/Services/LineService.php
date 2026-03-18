@@ -13,6 +13,36 @@ class LineService
 {
     private const REPLY_URL = 'https://api.line.me/v2/bot/message/reply';
 
+    private const PROFILE_URL = 'https://api.line.me/v2/bot/profile/%s';
+
+    /**
+     * ユーザープロフィールを取得（displayName, pictureUrl, statusMessage）
+     * 取得できない場合は null
+     *
+     * @return array{displayName: string, pictureUrl?: string, statusMessage?: string}|null
+     */
+    public function getProfile(string $userId): ?array
+    {
+        $token = config('services.line.channel_access_token');
+        if (empty($token)) {
+            return null;
+        }
+
+        $response = Http::withToken($token)->get(sprintf(self::PROFILE_URL, $userId));
+
+        if (! $response->successful()) {
+            return null;
+        }
+
+        $data = $response->json();
+
+        return [
+            'displayName' => $data['displayName'] ?? '',
+            'pictureUrl' => $data['pictureUrl'] ?? null,
+            'statusMessage' => $data['statusMessage'] ?? null,
+        ];
+    }
+
     public function verifySignature(string $body, string $signature): bool
     {
         $channelSecret = config('services.line.channel_secret');

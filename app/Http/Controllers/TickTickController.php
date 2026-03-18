@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\TickTickConnection;
+use App\Models\User;
 use App\Services\TickTickService;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
@@ -59,13 +60,17 @@ class TickTickController extends Controller
             }
         }
 
+        $errorRedirect = fn (string $msg) => redirect()
+            ->route(app()->environment('production') ? 'home' : 'chat.index')
+            ->with('error', $msg);
+
         if (! $identifier) {
-            return redirect('/')->with('error', 'Invalid state parameter');
+            return $errorRedirect('Invalid state parameter');
         }
 
         $code = $request->query('code');
         if (! $code) {
-            return redirect('/')->with('error', 'Authorization code missing');
+            return $errorRedirect('Authorization code missing');
         }
 
         try {
@@ -73,34 +78,64 @@ class TickTickController extends Controller
         } catch (\Throwable $e) {
             report($e);
 
-            return redirect('/')->with('error', 'TickTick 連携に失敗しました: '.$e->getMessage());
+            return $errorRedirect('TickTick 連携に失敗しました: '.$e->getMessage());
         }
 
-        TickTickConnection::updateOrCreate(
-            ['identifier' => $identifier],
-            [
-                'user_id' => null,
-                'access_token' => $tokens['access_token'],
-                'refresh_token' => $tokens['refresh_token'] ?? null,
-                'expires_at' => $tokens['expires_at'] ?? null,
-            ]
-        );
+        $sourceIdentifier = $identifier;
+        $identifier = $sourceIdentifier;
+        $lineUserId = str_starts_with($sourceIdentifier, 'line_') ? $sourceIdentifier : null;
+        $sessionId = $lineUserId ? null : $request->session()->getId();
+
+        $user = $lineUserId ? User::where('line_user_id', $lineUserId)->first() : null;
+
+        $query = TickTickConnection::query();
+        if ($user) {
+            $query->where('user_id', $user->id);
+        } elseif ($sessionId) {
+            $query->where('session_id', $sessionId);
+        }
+        $existing = $query->orWhere('identifier', $sourceIdentifier)->first();
+
+        $data = [
+            'user_id' => $user?->id,
+            'identifier' => $identifier,
+            'access_token' => $tokens['access_token'],
+            'refresh_token' => $tokens['refresh_token'] ?? null,
+            'expires_at' => $tokens['expires_at'] ?? null,
+            'session_id' => $sessionId,
+        ];
+
+        if ($existing) {
+            $existing->update($data);
+        } else {
+            TickTickConnection::create($data);
+        }
 
         $successMessage = 'TickTick と連携しました！タスクの追加や確認ができます。';
-        if (str_starts_with($identifier, 'line_')) {
+        if ($lineUserId) {
             return redirect()->route('ticktick.line-success')->with('success', $successMessage);
         }
 
-        return redirect('/')->with('success', $successMessage);
+        return redirect()->route(app()->environment('production') ? 'home' : 'chat.index')->with('success', $successMessage);
     }
 
     /**
-     * 連携を解除
+     * 連携を解除（Web セッションからのみ）
      */
     public function disconnect(Request $request): RedirectResponse
     {
-        $identifier = $this->getIdentifier($request);
-        TickTickConnection::where('identifier', $identifier)->delete();
+        $sessionId = $request->session()->getId();
+        $connection = TickTickConnection::where('session_id', $sessionId)
+            ->orWhere('identifier', 'session_'.$sessionId)
+            ->first();
+
+        if ($connection) {
+            if ($connection->user_id) {
+                $connection->update(['session_id' => null]);
+            } else {
+                $connection->delete();
+            }
+        }
 
         return redirect('/')->with('success', 'TickTick の連携を解除しました');
     }

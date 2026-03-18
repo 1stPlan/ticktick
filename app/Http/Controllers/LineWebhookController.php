@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\TickTickConnection;
+use App\Models\User;
 use App\Services\AgentService;
 use App\Services\ChatService;
 use App\Services\LineService;
@@ -47,8 +48,35 @@ class LineWebhookController extends Controller
     {
         $type = $event['type'] ?? '';
 
-        if ($type === 'message') {
+        if ($type === 'follow') {
+            $this->handleFollow($event);
+        } elseif ($type === 'message') {
             $this->handleMessage($event);
+        }
+    }
+
+    /**
+     * 友だち追加時に User を登録
+     */
+    private function handleFollow(array $event): void
+    {
+        $userId = $event['source']['userId'] ?? '';
+        if ($userId === '') {
+            return;
+        }
+
+        $lineUserId = 'line_'.$userId;
+        $profile = $this->lineService->getProfile($userId);
+        $name = $profile['displayName'] ?? 'LINE User';
+
+        User::firstOrCreate(
+            ['line_user_id' => $lineUserId],
+            ['name' => $name]
+        );
+
+        $replyToken = $event['replyToken'] ?? '';
+        if ($replyToken !== '') {
+            $this->lineService->reply($replyToken, '友だち追加ありがとうございます！予定の確認やタスクの追加ができます。TickTick と連携するには「連携」と送ってください。');
         }
     }
 
@@ -67,18 +95,22 @@ class LineWebhookController extends Controller
             return;
         }
 
-        $identifier = 'line_'.$userId;
-        $tickTickConnection = TickTickConnection::where('identifier', $identifier)->first();
+        $lineUserId = 'line_'.$userId;
+        $user = User::where('line_user_id', $lineUserId)->first();
+        $tickTickConnection = $user
+            ? TickTickConnection::where('user_id', $user->id)->first()
+            : null;
 
         if (! $tickTickConnection && $this->isTickTickConnectRequest($userMessage)) {
-            $url = url('/ticktick/connect?for='.urlencode($identifier));
+            $url = url('/ticktick/connect?for='.urlencode($lineUserId));
             $response = "TickTick と連携するには、以下のリンクを開いて認証を完了してください。\n\n{$url}";
             $this->lineService->reply($replyToken, $response);
 
             return;
         }
 
-        $conversationHistory = $this->getConversationHistory($identifier);
+        $cacheIdentifier = $tickTickConnection ? $tickTickConnection->identifier : $lineUserId;
+        $conversationHistory = $this->getConversationHistory($cacheIdentifier);
         $conversationHistory = collect($conversationHistory)->take(-10)->values()->all();
 
         try {
@@ -94,7 +126,7 @@ class LineWebhookController extends Controller
                 $this->chatService->rememberConversation($userMessage, $response, null);
             }
 
-            $this->saveConversationHistory($identifier, $userMessage, $response);
+            $this->saveConversationHistory($cacheIdentifier, $userMessage, $response);
         } catch (\Throwable $e) {
             report($e);
             $response = config('app.debug')
@@ -107,7 +139,7 @@ class LineWebhookController extends Controller
 
     private function getConversationHistory(string $identifier): array
     {
-        return Cache::get("line_conv_{$identifier}", []);
+        return Cache::get("conv_{$identifier}", []);
     }
 
     private function saveConversationHistory(string $identifier, string $userMessage, string $assistantResponse): void
@@ -117,7 +149,7 @@ class LineWebhookController extends Controller
         $history[] = ['role' => 'assistant', 'content' => $assistantResponse];
         $history = array_slice($history, -20);
 
-        Cache::put("line_conv_{$identifier}", $history, now()->addHours(24));
+        Cache::put("conv_{$identifier}", $history, now()->addHours(24));
     }
 
     private function isTickTickConnectRequest(string $message): bool

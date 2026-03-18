@@ -97,7 +97,7 @@ class MemoryService
     {
         $apiKey = config('services.openai.api_key');
         if (empty($apiKey)) {
-            throw new \RuntimeException('OPENAI_API_KEY が設定されていません。.env を確認してください。');
+            throw new \RuntimeException('AIサービスが設定されていないため、ベクトル化できません。');
         }
 
         $client = OpenAI::client($apiKey, config('services.openai.organization'));
