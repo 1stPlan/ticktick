@@ -22,20 +22,35 @@ class LineWebhookController extends Controller
 
     /**
      * LINE Webhook 受信
+     * GET: 疎通確認用（ブラウザで開いたときなど）
+     * POST: LINE からのイベント受信
      */
     public function webhook(Request $request): Response
     {
+        if ($request->isMethod('GET')) {
+            return response('LINE Webhook endpoint (POST only for events)', 200);
+        }
+
         $body = $request->getContent();
         $signature = $request->header('X-Line-Signature', '');
 
+        Log::info('LineWebhook: リクエスト受信', [
+            'body_length' => strlen($body),
+            'has_signature' => $signature !== '',
+        ]);
+
         if (! $this->lineService->verifySignature($body, $signature)) {
-            Log::warning('LineWebhook: 署名検証失敗');
+            Log::warning('LineWebhook: 署名検証失敗', [
+                'channel_secret_set' => ! empty(config('services.line.channel_secret')),
+            ]);
 
             return response('', 401);
         }
 
         $data = json_decode($body, true);
         $events = $data['events'] ?? [];
+
+        Log::info('LineWebhook: イベント処理開始', ['event_count' => count($events)]);
 
         foreach ($events as $event) {
             $this->handleEvent($event);
@@ -48,10 +63,14 @@ class LineWebhookController extends Controller
     {
         $type = $event['type'] ?? '';
 
+        Log::info('LineWebhook: イベント種別', ['type' => $type]);
+
         if ($type === 'follow') {
             $this->handleFollow($event);
         } elseif ($type === 'message') {
             $this->handleMessage($event);
+        } else {
+            Log::info('LineWebhook: 未処理のイベント種別', ['type' => $type]);
         }
     }
 
@@ -76,14 +95,22 @@ class LineWebhookController extends Controller
 
         $replyToken = $event['replyToken'] ?? '';
         if ($replyToken !== '') {
-            $this->lineService->reply($replyToken, '友だち追加ありがとうございます！予定の確認やタスクの追加ができます。TickTick と連携するには「連携」と送ってください。');
+            if (! $this->lineService->reply($replyToken, '友だち追加ありがとうございます！予定の確認やタスクの追加ができます。TickTick と連携するには「連携」と送ってください。')) {
+                Log::error('LineWebhook: Follow 時の Reply API 失敗', [
+                    'line_user_id' => $lineUserId,
+                    'channel_token_set' => ! empty(config('services.line.channel_access_token')),
+                ]);
+            }
         }
     }
 
     private function handleMessage(array $event): void
     {
         $message = $event['message'] ?? [];
-        if (($message['type'] ?? '') !== 'text') {
+        $messageType = $message['type'] ?? '';
+        if ($messageType !== 'text') {
+            Log::info('LineWebhook: テキスト以外のメッセージはスキップ', ['type' => $messageType]);
+
             return;
         }
 
@@ -92,6 +119,8 @@ class LineWebhookController extends Controller
         $userId = $event['source']['userId'] ?? '';
 
         if ($userMessage === '') {
+            Log::info('LineWebhook: 空メッセージのためスキップ');
+
             return;
         }
 
@@ -104,7 +133,9 @@ class LineWebhookController extends Controller
         if (! $tickTickConnection && $this->isTickTickConnectRequest($userMessage)) {
             $url = url('/ticktick/connect?for='.urlencode($lineUserId));
             $response = "TickTick と連携するには、以下のリンクを開いて認証を完了してください。\n\n{$url}";
-            $this->lineService->reply($replyToken, $response);
+            if (! $this->lineService->reply($replyToken, $response)) {
+                Log::error('LineWebhook: TickTick 連携案内の Reply API 失敗');
+            }
 
             return;
         }
@@ -134,7 +165,12 @@ class LineWebhookController extends Controller
                 : '申し訳ございません。エラーが発生しました。しばらくしてから再度お試しください。';
         }
 
-        $this->lineService->reply($replyToken, $response);
+        if (! $this->lineService->reply($replyToken, $response)) {
+            Log::error('LineWebhook: Reply API 失敗', [
+                'user_id' => $userId,
+                'channel_token_set' => ! empty(config('services.line.channel_access_token')),
+            ]);
+        }
     }
 
     private function getConversationHistory(string $identifier): array

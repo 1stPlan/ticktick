@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 
 /**
  * LINE Messaging API クライアント
@@ -75,6 +76,13 @@ class LineService
                     ],
                 ],
             ]);
+
+        if (! $response->successful()) {
+            Log::error('LineService: Reply API 失敗', [
+                'status' => $response->status(),
+                'body' => $response->body(),
+            ]);
+        }
 
         return $response->successful();
     }

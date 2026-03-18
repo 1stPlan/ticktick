@@ -25,6 +25,11 @@ class RouteServiceProvider extends ServiceProvider
     public function boot(): void
     {
         RateLimiter::for('api', function (Request $request) {
+            // LINE Webhook はレート制限を除外（LINE サーバーからの一括リクエストに対応）
+            if ($request->is('api/line/webhook')) {
+                return Limit::none();
+            }
+
             return Limit::perMinute(60)->by($request->user()?->id ?: $request->ip());
         });
 

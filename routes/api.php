@@ -19,4 +19,5 @@ Route::middleware('auth:sanctum')->get('/user', function (Request $request) {
     return $request->user();
 });
 
-Route::post('/line/webhook', [LineWebhookController::class, 'webhook']);
+// LINE Webhook: POST が本処理、GET は疎通確認用（ブラウザで開いたときなど）
+Route::match(['get', 'post'], '/line/webhook', [LineWebhookController::class, 'webhook']);
