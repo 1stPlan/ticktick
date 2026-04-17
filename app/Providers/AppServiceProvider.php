@@ -7,8 +7,9 @@ use App\Services\AgentService;
 use App\Services\ChatService;
 use App\Services\MemoryService;
 use App\Services\TickTickService;
-use Spatie\FlareClient\Flare;
+use App\Services\WeatherService;
 use Illuminate\Support\ServiceProvider;
+use Spatie\FlareClient\Flare;
 
 class AppServiceProvider extends ServiceProvider
 {
@@ -22,10 +23,12 @@ class AppServiceProvider extends ServiceProvider
             $app->make(MemoryService::class)
         ));
         $this->app->singleton(TickTickService::class, fn () => new TickTickService);
+        $this->app->singleton(WeatherService::class, fn () => new WeatherService);
         $this->app->singleton(AgentService::class, fn ($app) => new AgentService(
             $app->make(MemoryService::class),
             $app->make(TickTickService::class),
-            $app->make(ChatService::class)
+            $app->make(ChatService::class),
+            $app->make(WeatherService::class)
         ));
     }
 
@@ -36,7 +39,7 @@ class AppServiceProvider extends ServiceProvider
     {
         // Livewire 4 と Spatie Ignition の非互換を回避（ComponentRegistry が存在しない）
         $this->app->resolving(Flare::class, function (Flare $flare) {
-            $flare->setContextProviderDetector(new SafeLivewireContextProviderDetector());
+            $flare->setContextProviderDetector(new SafeLivewireContextProviderDetector);
         });
     }
 }

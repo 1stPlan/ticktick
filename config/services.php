@@ -66,4 +66,13 @@ return [
         'line_default_project_id' => env('TICKTICK_LINE_DEFAULT_PROJECT_ID'),
     ],
 
+    /*
+    |--------------------------------------------------------------------------
+    | 天気（Open-Meteo 無料 API・キー不要）
+    |--------------------------------------------------------------------------
+    */
+    'weather' => [
+        'enabled' => env('WEATHER_API_ENABLED', true),
+    ],
+
 ];

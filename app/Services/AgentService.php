@@ -14,7 +14,33 @@ use OpenAI;
  */
 class AgentService
 {
-    private static function getTools(): array
+    private static function weatherToolDefinition(): array
+    {
+        return [
+            'type' => 'function',
+            'function' => [
+                'name' => 'get_weather_forecast',
+                'description' => '日本国内の天気予報を取得する。ユーザーが天気・気温・降水・予報などを尋ねたときに使う。地名はユーザーが言及した都道府県・市区町村を location に入れる。',
+                'parameters' => [
+                    'type' => 'object',
+                    'properties' => [
+                        'location' => [
+                            'type' => 'string',
+                            'description' => '地名（例: 山口県、東京都、大阪市）。',
+                        ],
+                        'when' => [
+                            'type' => 'string',
+                            'description' => 'today=今日, tomorrow=明日, day_after_tomorrow=明後日。省略時はユーザーの文から推測。',
+                            'enum' => ['today', 'tomorrow', 'day_after_tomorrow'],
+                        ],
+                    ],
+                    'required' => ['location'],
+                ],
+            ],
+        ];
+    }
+
+    private static function tickTickToolDefinitions(): array
     {
         return [
             [
@@ -93,10 +119,27 @@ class AgentService
         ];
     }
 
+    /**
+     * @return array<int, array<string, mixed>>
+     */
+    private function buildTools(?TickTickConnection $tickTickConnection): array
+    {
+        $tools = [];
+        if (config('services.weather.enabled', true)) {
+            $tools[] = self::weatherToolDefinition();
+        }
+        if ($tickTickConnection !== null) {
+            $tools = array_merge($tools, self::tickTickToolDefinitions());
+        }
+
+        return $tools;
+    }
+
     public function __construct(
         private readonly MemoryService $memoryService,
         private readonly TickTickService $tickTickService,
-        private readonly ChatService $chatService
+        private readonly ChatService $chatService,
+        private readonly WeatherService $weatherService,
     ) {}
 
     /**
@@ -121,18 +164,26 @@ class AgentService
             ['role' => 'user', 'content' => $userMessage],
         ];
 
-        $tools = $tickTickConnection ? self::getTools() : [];
+        $tools = $this->buildTools($tickTickConnection);
         $maxIterations = 5;
         $iteration = 0;
 
+        $bothWeatherAndSchedule = $this->isWeatherQuery($userMessage) && $this->isScheduleRelatedQuery($userMessage);
+
         $forceListTasks = $tickTickConnection
             && $this->isScheduleRelatedQuery($userMessage)
-            && ! $this->isCreateTaskQuery($userMessage);
+            && ! $this->isCreateTaskQuery($userMessage)
+            && ! $bothWeatherAndSchedule;
 
         $forceCreateTask = $tickTickConnection && $this->isCreateTaskQuery($userMessage);
 
+        $forceWeather = config('services.weather.enabled', true)
+            && $this->isWeatherQuery($userMessage)
+            && ! $this->isCreateTaskQuery($userMessage)
+            && ! $bothWeatherAndSchedule;
+
         while ($iteration < $maxIterations) {
-            $toolChoice = $this->initialToolChoice($iteration, $forceListTasks, $forceCreateTask);
+            $toolChoice = $this->initialToolChoice($iteration, $forceListTasks, $forceCreateTask, $forceWeather);
             $response = $this->callOpenAI($messages, $tools, $toolChoice);
             $choice = $response->choices[0];
             $message = $choice->message;
@@ -294,7 +345,7 @@ class AgentService
     }
 
     /** @return string|array<string, mixed> */
-    private function initialToolChoice(int $iteration, bool $forceListTasks, bool $forceCreateTask): string|array
+    private function initialToolChoice(int $iteration, bool $forceListTasks, bool $forceCreateTask, bool $forceWeather): string|array
     {
         if ($iteration !== 0) {
             return 'auto';
@@ -304,6 +355,9 @@ class AgentService
         }
         if ($forceCreateTask) {
             return ['type' => 'function', 'function' => ['name' => 'create_ticktick_task']];
+        }
+        if ($forceWeather) {
+            return ['type' => 'function', 'function' => ['name' => 'get_weather_forecast']];
         }
 
         return 'auto';
@@ -318,6 +372,15 @@ class AgentService
 丁寧で親しみやすい口調で話してください。
 
 PROMPT;
+
+        if (config('services.weather.enabled', true)) {
+            $base .= <<<'PROMPT'
+
+【天気予報（Open-Meteo 無料 API・キー不要）】
+- 天気・気温・降水確率など**最新の予報**が必要なときは **get_weather_forecast** ツールを呼び出してください。地名がなければユーザーが言及している都道府県・市区町村を location に入れてください。
+
+PROMPT;
+        }
 
         if ($tickTickConnected) {
             $base .= <<<PROMPT
@@ -353,6 +416,16 @@ PROMPT;
      */
     private function executeTool(string $name, array $args, ?TickTickConnection $connection, string $userMessage = '', array $conversationMessages = []): string|array
     {
+        if ($name === 'get_weather_forecast') {
+            try {
+                return $this->toolGetWeatherForecast($args, $userMessage);
+            } catch (\Throwable $e) {
+                report($e);
+
+                return 'エラーが発生しました: '.$e->getMessage();
+            }
+        }
+
         if (! $connection) {
             return 'TickTick が連携されていません。設定から連携してください。';
         }
@@ -369,6 +442,74 @@ PROMPT;
 
             return 'エラーが発生しました: '.$e->getMessage();
         }
+    }
+
+    /**
+     * @param  array<string, mixed>  $args
+     * @return array<string, mixed>
+     */
+    private function toolGetWeatherForecast(array $args, string $userMessage): array
+    {
+        $location = trim((string) ($args['location'] ?? ''));
+        if ($location === '') {
+            $location = $this->extractLocationFromMessage($userMessage) ?? '';
+        }
+        if ($location === '') {
+            return [
+                'success' => false,
+                'message' => '地域を特定できませんでした。都道府県や市区町村名を含めて送ってください。',
+            ];
+        }
+
+        $when = $args['when'] ?? null;
+        if (! is_string($when) || $when === '' || ! in_array($when, ['today', 'tomorrow', 'day_after_tomorrow'], true)) {
+            $when = $this->inferWeatherWhen($userMessage);
+        }
+
+        Log::info('AgentService: get_weather_forecast を実行', ['location' => $location, 'when' => $when]);
+
+        return $this->weatherService->forecastSummary($location, $when);
+    }
+
+    private function inferWeatherWhen(string $userMessage): string
+    {
+        if (preg_match('/明後日|あさって/u', $userMessage)) {
+            return 'day_after_tomorrow';
+        }
+        if (preg_match('/明日/u', $userMessage)) {
+            return 'tomorrow';
+        }
+        if (preg_match('/今日|本日/u', $userMessage)) {
+            return 'today';
+        }
+
+        return 'tomorrow';
+    }
+
+    private function extractLocationFromMessage(string $message): ?string
+    {
+        if (preg_match('/([\p{Han}]{1,6}(?:都|道|府|県))/u', $message, $m)) {
+            return $m[1];
+        }
+        if (preg_match('/(東京都|大阪府|京都府|北海道)/u', $message, $m)) {
+            return $m[1];
+        }
+        if (preg_match('/(札幌|仙台|横浜|川崎|名古屋|京都|大阪|神戸|広島|北九州|福岡|那覇)市/u', $message, $m)) {
+            return $m[1];
+        }
+
+        return null;
+    }
+
+    /**
+     * 天気ツールを初回に強制するか（雑談と区別するヒューリスティック）
+     */
+    private function isWeatherQuery(string $message): bool
+    {
+        return (bool) preg_match(
+            '/天気|気温|降水|気象|天候|天気予報|雨量|台風|雷雨|猛暑|寒潮|紫外線|湿度|風速|梅雨|大雪|体感|雨が|雨は|雨か|雨に|雨天|雨模様|雪が|雪は|雪か/u',
+            $message
+        );
     }
 
     /**
