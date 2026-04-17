@@ -62,6 +62,8 @@ return [
         'client_id' => env('TICKTICK_CLIENT_ID'),
         'client_secret' => env('TICKTICK_CLIENT_SECRET'),
         'redirect_uri' => rtrim(env('TICKTICK_REDIRECT_URI', env('APP_URL').'/ticktick/callback')),
+        /** Web のリスト URL の #p/ の直後（例: 69aa7607ba9f51142a1f8072）。DB の default_project_id 未設定時のフォールバック */
+        'line_default_project_id' => env('TICKTICK_LINE_DEFAULT_PROJECT_ID'),
     ],
 
 ];

@@ -84,17 +84,13 @@ class TickTickController extends Controller
         $sourceIdentifier = $identifier;
         $identifier = $sourceIdentifier;
         $lineUserId = str_starts_with($sourceIdentifier, 'line_') ? $sourceIdentifier : null;
-        $sessionId = $lineUserId ? null : $request->session()->getId();
 
         $user = $lineUserId ? User::where('line_user_id', $lineUserId)->first() : null;
 
-        $query = TickTickConnection::query();
-        if ($user) {
-            $query->where('user_id', $user->id);
-        } elseif ($sessionId) {
-            $query->where('session_id', $sessionId);
+        $existing = TickTickConnection::where('identifier', $sourceIdentifier)->first();
+        if (! $existing && $user) {
+            $existing = TickTickConnection::where('user_id', $user->id)->first();
         }
-        $existing = $query->orWhere('identifier', $sourceIdentifier)->first();
 
         $data = [
             'user_id' => $user?->id,
@@ -102,7 +98,6 @@ class TickTickController extends Controller
             'access_token' => $tokens['access_token'],
             'refresh_token' => $tokens['refresh_token'] ?? null,
             'expires_at' => $tokens['expires_at'] ?? null,
-            'session_id' => $sessionId,
         ];
 
         if ($existing) {
@@ -120,22 +115,12 @@ class TickTickController extends Controller
     }
 
     /**
-     * 連携を解除（Web セッションからのみ）
+     * 連携を解除（ローカル開発時の Web チャット用 session_* 連携のみ）
      */
     public function disconnect(Request $request): RedirectResponse
     {
         $sessionId = $request->session()->getId();
-        $connection = TickTickConnection::where('session_id', $sessionId)
-            ->orWhere('identifier', 'session_'.$sessionId)
-            ->first();
-
-        if ($connection) {
-            if ($connection->user_id) {
-                $connection->update(['session_id' => null]);
-            } else {
-                $connection->delete();
-            }
-        }
+        TickTickConnection::where('identifier', 'session_'.$sessionId)->delete();
 
         return redirect('/')->with('success', 'TickTick の連携を解除しました');
     }

@@ -3,7 +3,6 @@
 namespace App\Services;
 
 use App\Models\TickTickConnection;
-use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 use OpenAI;
 
@@ -130,10 +129,10 @@ class AgentService
             && $this->isScheduleRelatedQuery($userMessage)
             && ! $this->isCreateTaskQuery($userMessage);
 
+        $forceCreateTask = $tickTickConnection && $this->isCreateTaskQuery($userMessage);
+
         while ($iteration < $maxIterations) {
-            $toolChoice = ($iteration === 0 && $forceListTasks)
-                ? ['type' => 'function', 'function' => ['name' => 'list_ticktick_tasks']]
-                : 'auto';
+            $toolChoice = $this->initialToolChoice($iteration, $forceListTasks, $forceCreateTask);
             $response = $this->callOpenAI($messages, $tools, $toolChoice);
             $choice = $response->choices[0];
             $message = $choice->message;
@@ -154,34 +153,17 @@ class AgentService
             }
             $messages[] = $assistantMsg;
 
-            if ($choice->finishReason === 'stop' || empty($message->toolCalls)) {
-                $content = $message->content ?? null;
-                if ($content === null || $content === '' || trim($content) === '') {
-                    $fallback = $this->formatLastToolResultAsFallback($messages, $userMessage);
-                    if ($fallback !== null) {
-                        Log::info('AgentService: モデルが content を返さなかったため、ツール結果をフォールバックとして使用');
-                        $content = $fallback;
-                    } elseif ($forceListTasks && $tickTickConnection) {
-                        // モデルがツールを呼ばずに stop した場合、手動で list_ticktick_tasks を実行
-                        $today = now();
-                        $args = ['start_date' => '', 'end_date' => ''];
-                        // 特定タスク検索（〇〇の日付など）の場合は日付範囲を指定せず全件から検索
-                        if (! preg_match('/(.+?)の(日付|詳細|予定|いつ)/u', $userMessage)) {
-                            [$args['start_date'], $args['end_date']] = $this->inferDateRangeFromMessage($userMessage, $today);
-                        }
-                        $result = $this->executeTool(
-                            'list_ticktick_tasks',
-                            $args,
-                            $tickTickConnection,
-                            $userMessage,
-                            $messages
-                        );
-                        $content = $this->formatToolResultAsText($result, $userMessage);
-                        Log::info('AgentService: モデルがツールを呼ばなかったため、手動で list_ticktick_tasks を実行');
-                    } else {
-                        $content = '応答を生成できませんでした。';
-                    }
-                }
+            // finish_reason=stop でも tool_calls が付いていると、旧条件だとツール未実行で finalize に入ってしまう。
+            // ツール呼び出しがあるときは必ず実行し、空のときだけ本文確定へ進む。
+            if (empty($message->toolCalls)) {
+                $content = $this->finalizeAssistantContentWithoutToolLoop(
+                    $message,
+                    $userMessage,
+                    $tickTickConnection,
+                    $messages,
+                    $forceListTasks,
+                    $forceCreateTask
+                );
                 $this->chatService->rememberConversation($userMessage, $content, $userId);
 
                 return $content;
@@ -210,6 +192,123 @@ class AgentService
         return '申し訳ございません。処理が複雑になりすぎたため、もう一度お試しください。';
     }
 
+    /**
+     * finishReason=stop かつツール未実行のとき、本文を確定する（モデルが誤案内のみ返した場合はフォールバックで API 追加）
+     *
+     * @param  array<int, array{role: string, content: ?string}>  $messages
+     */
+    private function finalizeAssistantContentWithoutToolLoop(
+        object $assistantMessage,
+        string $userMessage,
+        ?TickTickConnection $tickTickConnection,
+        array $messages,
+        bool $forceListTasks,
+        bool $forceCreateTask
+    ): string {
+        $content = $assistantMessage->content ?? null;
+
+        if ($content !== null && trim((string) $content) !== '') {
+            return $content;
+        }
+
+        // ツールは実行済みだがモデルが本文を返さない場合は、直近のツール結果を優先（手動 create より先）
+        $fallback = $this->formatLastToolResultAsFallback($messages, $userMessage);
+        if ($fallback !== null) {
+            Log::info('AgentService: モデルが content を返さなかったため、ツール結果をフォールバックとして使用');
+
+            return $fallback;
+        }
+
+        if ($forceListTasks && $tickTickConnection) {
+            Log::info('AgentService: list_ticktick_tasks をフォールバック実行');
+
+            return $this->runManualListTickTickTasks($userMessage, $tickTickConnection, $messages);
+        }
+
+        if ($forceCreateTask && $tickTickConnection) {
+            $manual = $this->runManualCreateTickTickTask($userMessage, $tickTickConnection, $messages);
+            if ($manual !== null && trim($manual) !== '') {
+                return $manual;
+            }
+
+            Log::warning('AgentService: タスク追加を解釈できずフォールバックも不可', [
+                'user_message_preview' => mb_substr($userMessage, 0, 200),
+            ]);
+
+            return 'タスクの内容が分かりませんでした。「〇〇を追加して」や「〇〇という予定を追加して」のように送ってください。';
+        }
+
+        Log::warning('AgentService: 空応答のため既定メッセージを返却', [
+            'user_message_preview' => mb_substr($userMessage, 0, 200),
+        ]);
+
+        return '応答を生成できませんでした。もう一度短い文章で送ってください。';
+    }
+
+    /**
+     * @param  array<int, array{role: string, content: ?string}>  $messages
+     */
+    private function runManualCreateTickTickTask(
+        string $userMessage,
+        TickTickConnection $connection,
+        array $messages,
+    ): ?string {
+        $title = $this->inferTitleFromCreateMessage($userMessage);
+        if ($title === null || $title === '') {
+            return null;
+        }
+        $result = $this->executeTool(
+            'create_ticktick_task',
+            ['title' => $title],
+            $connection,
+            $userMessage,
+            $messages
+        );
+        Log::info('AgentService: モデルがツールを呼ばなかったため、手動で create_ticktick_task を実行', ['title' => $title]);
+
+        return $this->formatToolResultAsText($result, $userMessage);
+    }
+
+    /**
+     * @param  array<int, array{role: string, content: ?string}>  $messages
+     */
+    private function runManualListTickTickTasks(
+        string $userMessage,
+        TickTickConnection $connection,
+        array $messages,
+    ): string {
+        $today = now();
+        $args = ['start_date' => '', 'end_date' => ''];
+        if (! preg_match('/(.+?)の(日付|詳細|予定|いつ)/u', $userMessage)) {
+            [$args['start_date'], $args['end_date']] = $this->inferDateRangeFromMessage($userMessage, $today);
+        }
+        $result = $this->executeTool(
+            'list_ticktick_tasks',
+            $args,
+            $connection,
+            $userMessage,
+            $messages
+        );
+
+        return $this->formatToolResultAsText($result, $userMessage);
+    }
+
+    /** @return string|array<string, mixed> */
+    private function initialToolChoice(int $iteration, bool $forceListTasks, bool $forceCreateTask): string|array
+    {
+        if ($iteration !== 0) {
+            return 'auto';
+        }
+        if ($forceListTasks) {
+            return ['type' => 'function', 'function' => ['name' => 'list_ticktick_tasks']];
+        }
+        if ($forceCreateTask) {
+            return ['type' => 'function', 'function' => ['name' => 'create_ticktick_task']];
+        }
+
+        return 'auto';
+    }
+
     private function buildSystemPrompt(string $memoryContext, bool $tickTickConnected): string
     {
         $today = now()->format('Y-m-d');
@@ -224,12 +323,17 @@ PROMPT;
             $base .= <<<PROMPT
 
 【TickTick 連携済み - 重要】
+- **すでに TickTick は連携済みです。**「連携してください」「LINE で連携と送って」「認証リンクから」など、連携を促す説明は**禁止**です。予定・タスクの追加・一覧は必ずツール（create_ticktick_task / list_ticktick_tasks）で行ってください。
 - ユーザーが「予定」「タスク」「やること」について聞いた場合、ユーザーに聞き返してはいけません。必ず list_ticktick_tasks ツールを実行してTickTickからデータを取得し、その結果を伝えてください。
 - 「今週の予定教えて」「今日のタスクは？」「やること見せて」など、予定・タスク関連の質問には、まず list_ticktick_tasks を呼び出してください。ユーザーが把握している予定を教えてもらうような返答は禁止です。
 - 日付範囲（今週、今日、本日など）が指定された場合は start_date と end_date を YYYY-MM-DD で設定。今日・本日は {$today}
 - 「〇〇を追加して」「明日の予定に〇〇を入れて」などタスク追加には create_ticktick_task を使用。「明日の予定に〇〇を入れて」の場合は due_date を明日に必ず設定。「そのまま追加して」など詳細を省略された場合は、直前の会話で言及された日付（明日・今日・来週など）を due_date に反映すること。
 - 「〇〇の予定はいつ？」「〇〇の日付と詳細を教えて」と聞かれたら list_ticktick_tasks を search に〇〇を指定して呼び出し、該当タスクの日付・詳細を返す。今週の予定一覧ではなく、該当タスクのみを返すこと。
 - タスクの追加、プロジェクト確認も可能です。ツール実行後は結果を分かりやすく要約して伝えてください。
+
+【それ以外の会話（雑談・一般質問）】
+- 予定・タスク・TickTick の操作と**無関係**な内容（雑談、豆知識、文章の相談、軽い質問など）は、**通常の AI 秘書として自然に応答**してください。TickTick に誘導する必要はありません。
+- **リアルタイムの天気・気温・警報**など、外部データがないと正確に言えないことは、推測で数値を出さず、「最新は気象庁や天気アプリで確認して」と案内しつつ、一般的な説明や季節の話で補っても構いません。
 
 PROMPT;
         } else {
@@ -428,12 +532,61 @@ PROMPT;
         return ['projects' => $list];
     }
 
+    /**
+     * 予定・タスク一覧（list_ticktick_tasks）が妥当な質問か。
+     * 「今日」「教えて」だけで true になると天気など雑談が誤って一覧強制になるため、キーワードを絞る。
+     */
     private function isScheduleRelatedQuery(string $message): bool
     {
-        $keywords = ['予定', 'タスク', 'やること', '今週', '今月', '来週', '来月', '今日', '本日', '明日', 'スケジュール', '確認', '見せて', '教えて', 'リスト'];
+        if ($this->isLikelyNonScheduleContextQuery($message)) {
+            return false;
+        }
+
         $normalized = mb_strtolower($message);
 
-        return collect($keywords)->contains(fn ($k) => str_contains($normalized, $k));
+        $strongKeywords = ['予定', 'タスク', 'やること', 'スケジュール', 'リスト', 'リマインダー', 'ticktick', 'ティックティック'];
+        foreach ($strongKeywords as $k) {
+            if (str_contains($normalized, $k)) {
+                return true;
+            }
+        }
+
+        $periodKeywords = ['今週', '今月', '来週', '来月'];
+        foreach ($periodKeywords as $k) {
+            if (str_contains($normalized, $k)) {
+                return true;
+            }
+        }
+
+        $dateHints = ['今日', '本日', '明日', '明後日'];
+        $pairedHints = ['予定', 'タスク', 'やること', 'スケジュール', '会議', 'ミーティング', '面談', '空いて', '空き', '埋ま', 'リマインダー'];
+        foreach ($dateHints as $d) {
+            if (! str_contains($normalized, $d)) {
+                continue;
+            }
+            foreach ($pairedHints as $p) {
+                if (str_contains($normalized, $p)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * 天気・気象など、TickTick 予定一覧とは無関係な文脈（一覧ツールを強制したくない）
+     */
+    private function isLikelyNonScheduleContextQuery(string $message): bool
+    {
+        if (preg_match('/予定|タスク|スケジュール|やること|ticktick|ティックティック/u', $message)) {
+            return false;
+        }
+
+        return (bool) preg_match(
+            '/天気|気温|降水|気象|天候|台風|雨量|雷雨|猛暑|寒潮|警報|注意報|天気予報|紫外線|湿度|風速/u',
+            $message
+        );
     }
 
     /**
@@ -445,6 +598,49 @@ PROMPT;
         $normalized = mb_strtolower($message);
 
         return collect($keywords)->contains(fn ($k) => str_contains($normalized, $k));
+    }
+
+    /**
+     * タスク追加メッセージからタイトルを推定（ツール未実行時のフォールバック用）
+     */
+    private function inferTitleFromCreateMessage(string $message): ?string
+    {
+        $message = preg_replace('/[\x{200B}-\x{200D}\x{FEFF}]/u', '', $message);
+        $message = trim($message);
+        if ($message === '') {
+            return null;
+        }
+
+        if (preg_match('/^(.+?)という予定を/u', $message, $m)) {
+            return trim($m[1]);
+        }
+        if (preg_match('/^(.+?)をタスクに追加/u', $message, $m)) {
+            return trim($m[1]);
+        }
+        if (preg_match('/^(.+?)を追加して/u', $message, $m)) {
+            return trim($m[1]);
+        }
+        if (preg_match('/^(.+?)を追加/u', $message, $m)) {
+            return trim($m[1]);
+        }
+
+        // 「〇〇追加して」「〇〇 追加」のようにパターン外のとき、末尾の依頼語を除いてタイトル化
+        $suffixes = [
+            'という予定を追加して', 'という予定を追加', 'をタスクに追加して', 'をタスクに追加',
+            'を追加して', 'を追加', 'と追加して', '追加して', '追加',
+        ];
+        $candidate = $message;
+        foreach ($suffixes as $s) {
+            if (mb_strlen($candidate) > mb_strlen($s) && str_ends_with($candidate, $s)) {
+                $candidate = trim(mb_substr($candidate, 0, mb_strlen($candidate) - mb_strlen($s)));
+                break;
+            }
+        }
+        if ($candidate !== '' && $candidate !== $message && mb_strlen($candidate) <= 500) {
+            return $candidate;
+        }
+
+        return null;
     }
 
     /**
@@ -644,8 +840,6 @@ PROMPT;
 
     /**
      * ツール実行結果（配列または文字列）をユーザー向けテキストに整形する。
-     *
-     * @param  string|array  $result
      */
     private function formatToolResultAsText(string|array $result, string $userMessage = ''): string
     {
@@ -679,7 +873,6 @@ PROMPT;
 
     /**
      * @param  array<int, array{role: string, content: ?string, tool_calls?: mixed}>  $messages
-     * @param  string|array  $toolChoice
      */
     private function callOpenAI(array $messages, array $tools, string|array $toolChoice = 'auto'): \OpenAI\Responses\Chat\CreateResponse
     {

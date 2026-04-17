@@ -23,9 +23,7 @@ class ChatController extends Controller
     public function index(Request $request): View
     {
         $sessionId = $request->session()->getId();
-        $tickTickConnection = TickTickConnection::where('session_id', $sessionId)
-            ->orWhere('identifier', 'session_'.$sessionId)
-            ->first();
+        $tickTickConnection = TickTickConnection::where('identifier', 'session_'.$sessionId)->first();
         $connectUrl = url('/ticktick/connect');
 
         return view('chat.index', [
@@ -47,9 +45,7 @@ class ChatController extends Controller
         }
 
         $sessionId = $request->session()->getId();
-        $tickTickConnection = TickTickConnection::where('session_id', $sessionId)
-            ->orWhere('identifier', 'session_'.$sessionId)
-            ->first();
+        $tickTickConnection = TickTickConnection::where('identifier', 'session_'.$sessionId)->first();
 
         $cacheIdentifier = $tickTickConnection ? $tickTickConnection->identifier : 'session_'.$sessionId;
         $conversationHistory = Cache::get("conv_{$cacheIdentifier}", []);

@@ -60,7 +60,9 @@ class ChatService
 
     private function buildSystemPrompt(string $memoryContext): string
     {
-        $basePrompt = <<<'PROMPT'
+        $tickTickHint = '「TickTick と連携すると、あなたの予定を確認してお伝えできます。画面上部の「TickTick と連携」から設定してみてください」と案内してください。';
+
+        $basePrompt = <<<PROMPT
 あなたはユーザー専用の「最強のAI秘書」です。
 以下の役割を果たしてください：
 
@@ -70,7 +72,7 @@ class ChatService
 - 曖昧な質問には確認しながら、ユーザーにとって最適な提案をする
 
 【予定・タスクについて】
-- ユーザーが「予定」「タスク」「今週の予定」などについて聞いた場合、「TickTick と連携すると、あなたの予定を確認してお伝えできます。画面上部の「TickTick と連携」から設定してみてください」と案内してください。ユーザーに予定を教えてもらうような返答は避けてください。
+- ユーザーが「予定」「タスク」「今週の予定」などについて聞いた場合、{$tickTickHint}ユーザーに予定を教えてもらうような返答は避けてください。
 
 PROMPT;
 

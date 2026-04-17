@@ -84,20 +84,18 @@ class LineWebhookController extends Controller
             return;
         }
 
-        $lineUserId = 'line_'.$userId;
+        $user = $this->resolveLineUserForMessagingUserId($userId);
         $profile = $this->lineService->getProfile($userId);
         $name = $profile['displayName'] ?? 'LINE User';
-
-        User::firstOrCreate(
-            ['line_user_id' => $lineUserId],
-            ['name' => $name]
-        );
+        if (in_array($user->name, ['LINE User', ''], true)) {
+            $user->update(['name' => $name]);
+        }
 
         $replyToken = $event['replyToken'] ?? '';
         if ($replyToken !== '') {
             if (! $this->lineService->reply($replyToken, '友だち追加ありがとうございます！予定の確認やタスクの追加ができます。TickTick と連携するには「連携」と送ってください。')) {
                 Log::error('LineWebhook: Follow 時の Reply API 失敗', [
-                    'line_user_id' => $lineUserId,
+                    'line_user_id' => $user->line_user_id,
                     'channel_token_set' => ! empty(config('services.line.channel_access_token')),
                 ]);
             }
@@ -110,6 +108,10 @@ class LineWebhookController extends Controller
         $messageType = $message['type'] ?? '';
         if ($messageType !== 'text') {
             Log::info('LineWebhook: テキスト以外のメッセージはスキップ', ['type' => $messageType]);
+            $this->logTickTickLine([
+                'skipped' => 'not_text',
+                'message_type' => $messageType,
+            ]);
 
             return;
         }
@@ -120,42 +122,69 @@ class LineWebhookController extends Controller
 
         if ($userMessage === '') {
             Log::info('LineWebhook: 空メッセージのためスキップ');
+            $this->logTickTickLine(['skipped' => 'empty_text']);
+
+            return;
+        }
+
+        if ($userId === '') {
+            Log::warning('LineWebhook: source.userId なしのためスキップ');
+            $this->logTickTickLine(['skipped' => 'no_line_user_id']);
 
             return;
         }
 
         $lineUserId = 'line_'.$userId;
-        $user = User::where('line_user_id', $lineUserId)->first();
-        $tickTickConnection = $user
-            ? TickTickConnection::where('user_id', $user->id)->first()
-            : null;
+        $user = $this->resolveLineUserForMessagingUserId($userId);
 
-        if (! $tickTickConnection && $this->isTickTickConnectRequest($userMessage)) {
+        $tickTickConnection = TickTickConnection::where('user_id', $user->id)->first()
+            ?? TickTickConnection::where('identifier', $lineUserId)->first();
+
+        if ($tickTickConnection && $tickTickConnection->user_id === null) {
+            $tickTickConnection->update(['user_id' => $user->id]);
+        }
+
+        $this->logTickTickLine([
+            'ticktick_connected' => $tickTickConnection !== null,
+            'users_id' => $user->id,
+            'ticktick_connection_id' => $tickTickConnection?->id,
+        ]);
+
+        // 未連携時は LLM（ChatService）を使わない。文言が毎回変わったり「ログイン」と言い換えたりするのを防ぐ。
+        if (! $tickTickConnection) {
+            $cacheIdentifier = $lineUserId;
             $url = url('/ticktick/connect?for='.urlencode($lineUserId));
-            $response = "TickTick と連携するには、以下のリンクを開いて認証を完了してください。\n\n{$url}";
-            if (! $this->lineService->reply($replyToken, $response)) {
-                Log::error('LineWebhook: TickTick 連携案内の Reply API 失敗');
+            $response = "TickTick と連携していません。予定・タスクの確認や追加には、下のリンクから認証を完了してください。\n\n{$url}\n\n完了後に同じ内容を送り直してください。";
+
+            try {
+                $this->chatService->rememberConversation($userMessage, $response, $user->id);
+                $this->saveConversationHistory($cacheIdentifier, $userMessage, $response);
+            } catch (\Throwable $e) {
+                report($e);
+            }
+
+            $replyOk = $this->lineService->reply($replyToken, $response);
+
+            if (! $replyOk) {
+                Log::error('LineWebhook: Reply API 失敗（未連携・定型文）', [
+                    'user_id' => $userId,
+                ]);
             }
 
             return;
         }
 
-        $cacheIdentifier = $tickTickConnection ? $tickTickConnection->identifier : $lineUserId;
+        $cacheIdentifier = $tickTickConnection->identifier;
         $conversationHistory = $this->getConversationHistory($cacheIdentifier);
         $conversationHistory = collect($conversationHistory)->take(-10)->values()->all();
 
         try {
-            if ($tickTickConnection) {
-                $response = $this->agentService->run(
-                    $userMessage,
-                    $conversationHistory,
-                    $tickTickConnection,
-                    null
-                );
-            } else {
-                $response = $this->chatService->chat($userMessage, $conversationHistory, null);
-                $this->chatService->rememberConversation($userMessage, $response, null);
-            }
+            $response = $this->agentService->run(
+                $userMessage,
+                $conversationHistory,
+                $tickTickConnection,
+                $user->id
+            );
 
             $this->saveConversationHistory($cacheIdentifier, $userMessage, $response);
         } catch (\Throwable $e) {
@@ -165,12 +194,60 @@ class LineWebhookController extends Controller
                 : '申し訳ございません。エラーが発生しました。しばらくしてから再度お試しください。';
         }
 
-        if (! $this->lineService->reply($replyToken, $response)) {
+        Log::info('LineWebhook: reply_preview', [
+            'ticktick_connection_id' => $tickTickConnection->id,
+            'preview' => mb_substr($response, 0, 200),
+        ]);
+
+        $replyOk = $this->lineService->reply($replyToken, $response);
+
+        if (! $replyOk) {
             Log::error('LineWebhook: Reply API 失敗', [
                 'user_id' => $userId,
                 'channel_token_set' => ! empty(config('services.line.channel_access_token')),
             ]);
         }
+    }
+
+    /**
+     * TickTick 連携の有無（またはスキップ理由）を1行で記録する。
+     *
+     * @param  array<string, mixed>  $payload
+     */
+    private function logTickTickLine(array $payload): void
+    {
+        Log::info('LineWebhook: TickTick', $payload);
+    }
+
+    /**
+     * Messaging API の userId（例: U から始まる文字列）に対応する User を返す。
+     * DB に line_ 無しのレガシー値だけある場合は line_ 付きに正規化し、別ユーザーを増やさない。
+     */
+    private function resolveLineUserForMessagingUserId(string $messagingUserId): User
+    {
+        $canonical = 'line_'.$messagingUserId;
+
+        $user = User::where('line_user_id', $canonical)->first();
+        if ($user !== null) {
+            return $user;
+        }
+
+        $legacy = User::where('line_user_id', $messagingUserId)->first();
+        if ($legacy !== null) {
+            $legacy->update(['line_user_id' => $canonical]);
+            Log::info('LineWebhook: line_user_id を line_ 形式に正規化', [
+                'users_id' => $legacy->id,
+                'from' => $messagingUserId,
+                'to' => $canonical,
+            ]);
+
+            return $legacy->fresh();
+        }
+
+        return User::firstOrCreate(
+            ['line_user_id' => $canonical],
+            ['name' => 'LINE User']
+        );
     }
 
     private function getConversationHistory(string $identifier): array
@@ -188,11 +265,4 @@ class LineWebhookController extends Controller
         Cache::put("conv_{$identifier}", $history, now()->addHours(24));
     }
 
-    private function isTickTickConnectRequest(string $message): bool
-    {
-        $keywords = ['連携', 'ticktick', 'ティックティック', '認証', '設定'];
-        $normalized = mb_strtolower($message);
-
-        return collect($keywords)->contains(fn ($k) => str_contains($normalized, $k));
-    }
 }
