@@ -331,6 +331,10 @@ PROMPT;
 - 「〇〇の予定はいつ？」「〇〇の日付と詳細を教えて」と聞かれたら list_ticktick_tasks を search に〇〇を指定して呼び出し、該当タスクの日付・詳細を返す。今週の予定一覧ではなく、該当タスクのみを返すこと。
 - タスクの追加、プロジェクト確認も可能です。ツール実行後は結果を分かりやすく要約して伝えてください。
 
+【それ以外の会話（雑談・一般質問）】
+- 予定・タスク・TickTick の操作と**無関係**な内容（雑談、豆知識、文章の相談、軽い質問など）は、**通常の AI 秘書として自然に応答**してください。TickTick に誘導する必要はありません。
+- **リアルタイムの天気・気温・警報**など、外部データがないと正確に言えないことは、推測で数値を出さず、「最新は気象庁や天気アプリで確認して」と案内しつつ、一般的な説明や季節の話で補っても構いません。
+
 PROMPT;
         } else {
             $base .= "\n【TickTick 未連携】タスク管理機能を使うには、まず TickTick と連携してください。\n";
@@ -528,12 +532,61 @@ PROMPT;
         return ['projects' => $list];
     }
 
+    /**
+     * 予定・タスク一覧（list_ticktick_tasks）が妥当な質問か。
+     * 「今日」「教えて」だけで true になると天気など雑談が誤って一覧強制になるため、キーワードを絞る。
+     */
     private function isScheduleRelatedQuery(string $message): bool
     {
-        $keywords = ['予定', 'タスク', 'やること', '今週', '今月', '来週', '来月', '今日', '本日', '明日', 'スケジュール', '確認', '見せて', '教えて', 'リスト'];
+        if ($this->isLikelyNonScheduleContextQuery($message)) {
+            return false;
+        }
+
         $normalized = mb_strtolower($message);
 
-        return collect($keywords)->contains(fn ($k) => str_contains($normalized, $k));
+        $strongKeywords = ['予定', 'タスク', 'やること', 'スケジュール', 'リスト', 'リマインダー', 'ticktick', 'ティックティック'];
+        foreach ($strongKeywords as $k) {
+            if (str_contains($normalized, $k)) {
+                return true;
+            }
+        }
+
+        $periodKeywords = ['今週', '今月', '来週', '来月'];
+        foreach ($periodKeywords as $k) {
+            if (str_contains($normalized, $k)) {
+                return true;
+            }
+        }
+
+        $dateHints = ['今日', '本日', '明日', '明後日'];
+        $pairedHints = ['予定', 'タスク', 'やること', 'スケジュール', '会議', 'ミーティング', '面談', '空いて', '空き', '埋ま', 'リマインダー'];
+        foreach ($dateHints as $d) {
+            if (! str_contains($normalized, $d)) {
+                continue;
+            }
+            foreach ($pairedHints as $p) {
+                if (str_contains($normalized, $p)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * 天気・気象など、TickTick 予定一覧とは無関係な文脈（一覧ツールを強制したくない）
+     */
+    private function isLikelyNonScheduleContextQuery(string $message): bool
+    {
+        if (preg_match('/予定|タスク|スケジュール|やること|ticktick|ティックティック/u', $message)) {
+            return false;
+        }
+
+        return (bool) preg_match(
+            '/天気|気温|降水|気象|天候|台風|雨量|雷雨|猛暑|寒潮|警報|注意報|天気予報|紫外線|湿度|風速/u',
+            $message
+        );
     }
 
     /**
