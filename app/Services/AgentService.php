@@ -39,7 +39,7 @@ class AgentService
                             ],
                             'project_id' => [
                                 'type' => 'string',
-                                'description' => 'プロジェクトID。空文字でサーバー設定の既定リスト（TICKTICK_LINE_DEFAULT_PROJECT_ID）または受信トレイ。',
+                                'description' => 'プロジェクトID。空文字でインボックス。不明な場合は空にする。',
                             ],
                         ],
                         'required' => ['title'],
@@ -153,7 +153,9 @@ class AgentService
             }
             $messages[] = $assistantMsg;
 
-            if ($choice->finishReason === 'stop' || empty($message->toolCalls)) {
+            // finish_reason=stop でも tool_calls が付いていると、旧条件だとツール未実行で finalize に入ってしまう。
+            // ツール呼び出しがあるときは必ず実行し、空のときだけ本文確定へ進む。
+            if (empty($message->toolCalls)) {
                 $content = $this->finalizeAssistantContentWithoutToolLoop(
                     $message,
                     $userMessage,
@@ -204,32 +206,43 @@ class AgentService
         bool $forceCreateTask
     ): string {
         $content = $assistantMessage->content ?? null;
-        $noToolCalls = empty($assistantMessage->toolCalls);
 
-        if ($tickTickConnection && $forceCreateTask && $noToolCalls) {
+        if ($content !== null && trim((string) $content) !== '') {
+            return $content;
+        }
+
+        // ツールは実行済みだがモデルが本文を返さない場合は、直近のツール結果を優先（手動 create より先）
+        $fallback = $this->formatLastToolResultAsFallback($messages, $userMessage);
+        if ($fallback !== null) {
+            Log::info('AgentService: モデルが content を返さなかったため、ツール結果をフォールバックとして使用');
+
+            return $fallback;
+        }
+
+        if ($forceListTasks && $tickTickConnection) {
+            Log::info('AgentService: list_ticktick_tasks をフォールバック実行');
+
+            return $this->runManualListTickTickTasks($userMessage, $tickTickConnection, $messages);
+        }
+
+        if ($forceCreateTask && $tickTickConnection) {
             $manual = $this->runManualCreateTickTickTask($userMessage, $tickTickConnection, $messages);
-            if ($manual !== null) {
-                $content = $manual;
+            if ($manual !== null && trim($manual) !== '') {
+                return $manual;
             }
+
+            Log::warning('AgentService: タスク追加を解釈できずフォールバックも不可', [
+                'user_message_preview' => mb_substr($userMessage, 0, 200),
+            ]);
+
+            return 'タスクの内容が分かりませんでした。「〇〇を追加して」や「〇〇という予定を追加して」のように送ってください。';
         }
 
-        if ($content === null || trim((string) $content) === '') {
-            $fallback = $this->formatLastToolResultAsFallback($messages, $userMessage);
-            if ($fallback !== null) {
-                Log::info('AgentService: モデルが content を返さなかったため、ツール結果をフォールバックとして使用');
+        Log::warning('AgentService: 空応答のため既定メッセージを返却', [
+            'user_message_preview' => mb_substr($userMessage, 0, 200),
+        ]);
 
-                return $fallback;
-            }
-            if ($forceListTasks && $tickTickConnection) {
-                Log::info('AgentService: list_ticktick_tasks をフォールバック実行');
-
-                return $this->runManualListTickTickTasks($userMessage, $tickTickConnection, $messages);
-            }
-
-            return '応答を生成できませんでした。';
-        }
-
-        return $content;
+        return '応答を生成できませんでした。もう一度短い文章で送ってください。';
     }
 
     /**
@@ -251,7 +264,7 @@ class AgentService
             $userMessage,
             $messages
         );
-        Log::info('AgentService: create_ticktick_task をフォールバック実行', ['title' => $title]);
+        Log::info('AgentService: モデルがツールを呼ばなかったため、手動で create_ticktick_task を実行', ['title' => $title]);
 
         return $this->formatToolResultAsText($result, $userMessage);
     }
@@ -389,11 +402,7 @@ PROMPT;
 
         $projectId = $args['project_id'] ?? '';
         if ($projectId === '') {
-            $projectId = (string) ($connection->default_project_id ?? '');
-        }
-        if ($projectId === '') {
-            $line = config('services.ticktick.line_default_project_id');
-            $projectId = is_string($line) && $line !== '' ? $line : '';
+            $projectId = $connection->default_project_id ?? '';
         }
 
         $taskData = [
@@ -543,7 +552,12 @@ PROMPT;
      */
     private function inferTitleFromCreateMessage(string $message): ?string
     {
+        $message = preg_replace('/[\x{200B}-\x{200D}\x{FEFF}]/u', '', $message);
         $message = trim($message);
+        if ($message === '') {
+            return null;
+        }
+
         if (preg_match('/^(.+?)という予定を/u', $message, $m)) {
             return trim($m[1]);
         }
@@ -555,6 +569,22 @@ PROMPT;
         }
         if (preg_match('/^(.+?)を追加/u', $message, $m)) {
             return trim($m[1]);
+        }
+
+        // 「〇〇追加して」「〇〇 追加」のようにパターン外のとき、末尾の依頼語を除いてタイトル化
+        $suffixes = [
+            'という予定を追加して', 'という予定を追加', 'をタスクに追加して', 'をタスクに追加',
+            'を追加して', 'を追加', 'と追加して', '追加して', '追加',
+        ];
+        $candidate = $message;
+        foreach ($suffixes as $s) {
+            if (mb_strlen($candidate) > mb_strlen($s) && str_ends_with($candidate, $s)) {
+                $candidate = trim(mb_substr($candidate, 0, mb_strlen($candidate) - mb_strlen($s)));
+                break;
+            }
+        }
+        if ($candidate !== '' && $candidate !== $message && mb_strlen($candidate) <= 500) {
+            return $candidate;
         }
 
         return null;
@@ -757,8 +787,6 @@ PROMPT;
 
     /**
      * ツール実行結果（配列または文字列）をユーザー向けテキストに整形する。
-     *
-     * @param  string|array  $result
      */
     private function formatToolResultAsText(string|array $result, string $userMessage = ''): string
     {
@@ -792,7 +820,6 @@ PROMPT;
 
     /**
      * @param  array<int, array{role: string, content: ?string, tool_calls?: mixed}>  $messages
-     * @param  string|array  $toolChoice
      */
     private function callOpenAI(array $messages, array $tools, string|array $toolChoice = 'auto'): \OpenAI\Responses\Chat\CreateResponse
     {
