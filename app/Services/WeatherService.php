@@ -8,10 +8,83 @@ use Illuminate\Support\Facades\Log;
 /**
  * Open-Meteo（無料・APIキー不要）でジオコーディングと日次予報を取得する。
  *
+ * 注意: ジオコーディング API は「山口県」など日本語の県名全文でヒットしないことがあるため、
+ * 都道府県は英語名で検索する（Open-Meteo の仕様）。
+ *
  * @see https://open-meteo.com/
  */
 class WeatherService
 {
+    /**
+     * 日本の都道府県（正式名）→ Open-Meteo 検索用英語名
+     *
+     * @var array<string, string>
+     */
+    private const PREFECTURE_JA_TO_EN = [
+        '北海道' => 'Hokkaido',
+        '青森県' => 'Aomori',
+        '岩手県' => 'Iwate',
+        '宮城県' => 'Miyagi',
+        '秋田県' => 'Akita',
+        '山形県' => 'Yamagata',
+        '福島県' => 'Fukushima',
+        '茨城県' => 'Ibaraki',
+        '栃木県' => 'Tochigi',
+        '群馬県' => 'Gunma',
+        '埼玉県' => 'Saitama',
+        '千葉県' => 'Chiba',
+        '東京都' => 'Tokyo',
+        '神奈川県' => 'Kanagawa',
+        '新潟県' => 'Niigata',
+        '富山県' => 'Toyama',
+        '石川県' => 'Ishikawa',
+        '福井県' => 'Fukui',
+        '山梨県' => 'Yamanashi',
+        '長野県' => 'Nagano',
+        '岐阜県' => 'Gifu',
+        '静岡県' => 'Shizuoka',
+        '愛知県' => 'Aichi',
+        '三重県' => 'Mie',
+        '滋賀県' => 'Shiga',
+        '京都府' => 'Kyoto',
+        '大阪府' => 'Osaka',
+        '兵庫県' => 'Hyogo',
+        '奈良県' => 'Nara',
+        '和歌山県' => 'Wakayama',
+        '鳥取県' => 'Tottori',
+        '島根県' => 'Shimane',
+        '岡山県' => 'Okayama',
+        '広島県' => 'Hiroshima',
+        '山口県' => 'Yamaguchi',
+        '徳島県' => 'Tokushima',
+        '香川県' => 'Kagawa',
+        '愛媛県' => 'Ehime',
+        '高知県' => 'Kochi',
+        '福岡県' => 'Fukuoka',
+        '佐賀県' => 'Saga',
+        '長崎県' => 'Nagasaki',
+        '熊本県' => 'Kumamoto',
+        '大分県' => 'Oita',
+        '宮崎県' => 'Miyazaki',
+        '鹿児島県' => 'Kagoshima',
+        '沖縄県' => 'Okinawa',
+    ];
+
+    /**
+     * 略称・県名なし → 正式キー（PREFECTURE_JA_TO_EN のキー）
+     *
+     * @var array<string, string>
+     */
+    private const PREFECTURE_ALIAS_TO_JA = [
+        '北海道' => '北海道',
+        '東京' => '東京都',
+        '大阪' => '大阪府',
+        '京都' => '京都府',
+        '山口' => '山口県',
+        '広島' => '広島県',
+        '福岡' => '福岡県',
+    ];
+
     /**
      * @return array{success: bool, message: string}
      */
@@ -99,12 +172,47 @@ class WeatherService
      */
     private function geocode(string $query): ?array
     {
+        $prefJa = $this->resolvePrefectureJapaneseKey($query);
+        $searchNames = [];
+        $displayJa = null;
+
+        if ($prefJa !== null && isset(self::PREFECTURE_JA_TO_EN[$prefJa])) {
+            $searchNames[] = self::PREFECTURE_JA_TO_EN[$prefJa];
+            $displayJa = $prefJa;
+            Log::info('WeatherService: 都道府県を英語名でジオコーディング', ['ja' => $prefJa, 'en' => $searchNames[0]]);
+        }
+
+        $searchNames[] = $query;
+
+        foreach (array_unique($searchNames) as $name) {
+            if ($name === '') {
+                continue;
+            }
+            $row = $this->geocodeSearch($name);
+            if ($row !== null) {
+                if ($displayJa !== null) {
+                    $row['display_name'] = $displayJa;
+                }
+
+                return $row;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @return array{latitude: float, longitude: float, display_name: string}|null
+     */
+    private function geocodeSearch(string $name): ?array
+    {
         try {
             $response = Http::timeout(12)->get('https://geocoding-api.open-meteo.com/v1/search', [
-                'name' => $query,
-                'count' => 1,
+                'name' => $name,
+                'count' => 8,
                 'language' => 'ja',
                 'format' => 'json',
+                'country' => 'JP',
             ]);
         } catch (\Throwable $e) {
             Log::warning('WeatherService: geocode HTTP failed', ['error' => $e->getMessage()]);
@@ -118,23 +226,75 @@ class WeatherService
 
         $data = $response->json();
         $results = $data['results'] ?? [];
-        if ($results === [] || ! isset($results[0]['latitude'], $results[0]['longitude'])) {
+        if ($results === []) {
             return null;
         }
 
-        $r = $results[0];
-        $name = $r['name'] ?? $query;
-        $admin = $r['admin1'] ?? '';
+        $picked = $this->pickBestGeocodeResult($results);
 
-        $display = $admin !== '' && ! str_contains((string) $name, (string) $admin)
+        return $this->formatGeocodeRow($picked);
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $results
+     * @return array<string, mixed>
+     */
+    private function pickBestGeocodeResult(array $results): array
+    {
+        foreach ($results as $r) {
+            $fc = $r['feature_code'] ?? '';
+            if (in_array($fc, ['PPLA', 'PPLC', 'PPLA2', 'PPLA3', 'PPLA4'], true)) {
+                return $r;
+            }
+        }
+
+        foreach ($results as $r) {
+            $fc = $r['feature_code'] ?? '';
+            if ($fc === 'PPL') {
+                return $r;
+            }
+        }
+
+        return $results[0];
+    }
+
+    /**
+     * @param  array<string, mixed>  $r
+     * @return array{latitude: float, longitude: float, display_name: string}
+     */
+    private function formatGeocodeRow(array $r): array
+    {
+        $name = (string) ($r['name'] ?? '');
+        $admin = (string) ($r['admin1'] ?? '');
+
+        $display = $admin !== '' && $name !== '' && ! str_contains($name, $admin)
             ? "{$name}（{$admin}）"
-            : (string) $name;
+            : ($admin !== '' ? $admin : $name);
 
         return [
             'latitude' => (float) $r['latitude'],
             'longitude' => (float) $r['longitude'],
             'display_name' => $display,
         ];
+    }
+
+    private function resolvePrefectureJapaneseKey(string $query): ?string
+    {
+        $q = trim($query);
+        if (isset(self::PREFECTURE_JA_TO_EN[$q])) {
+            return $q;
+        }
+        if (isset(self::PREFECTURE_ALIAS_TO_JA[$q])) {
+            return self::PREFECTURE_ALIAS_TO_JA[$q];
+        }
+        if (! preg_match('/[都道府県]$/u', $q)) {
+            $withKen = $q.'県';
+            if (isset(self::PREFECTURE_JA_TO_EN[$withKen])) {
+                return $withKen;
+            }
+        }
+
+        return null;
     }
 
     /**
